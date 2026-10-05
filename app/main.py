@@ -905,7 +905,9 @@ def audit_verify(payload: AuditVerifyIn):
             "起点前/终点摘要必须是 64 位十六进制 SHA-256 摘要",
         )
 
-    # 区间端点存在性检查与链行读取在同一一致性视图内完成（全程只读）
+    # 端点存在性检查、链行读取与逐条还原核验在同一一致性视图内完成（全程只读）。
+    # 增量行不预先整体还原：核验走到某条时才按需还原，delta 格式被改成未知
+    # 版本等损坏会定位为该条 content_corrupted（HTTP 仍 200），而非服务器错误。
     with db.read_transaction() as conn:
         # 端点不存在须明确报错（回滚造成的编号空洞也算不存在）
         if not db.state_snapshot_exists(conn, payload.start_id):
@@ -920,15 +922,17 @@ def audit_verify(payload: AuditVerifyIn):
                 "SNAPSHOT_NOT_FOUND",
                 f"核验区间终止快照不存在：{payload.end_id}",
             )
-        rows = db.list_snapshot_chain_rows(
+        rows = db.fetch_snapshot_chain_rows_raw(
             conn, payload.start_id, payload.end_id
         )
-
-    return audit.verify_interval(
-        rows,
-        pre_start_digest=payload.pre_start_digest,
-        end_digest=payload.end_digest,
-    )
+        resolve_state = db.make_chain_row_state_resolver(conn)
+        result = audit.verify_interval(
+            rows,
+            pre_start_digest=payload.pre_start_digest,
+            end_digest=payload.end_digest,
+            resolve_state=resolve_state,
+        )
+    return result
 
 
 # ---------------------------------------------------------------- 调度演练（只读）

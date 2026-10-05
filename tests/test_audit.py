@@ -283,5 +283,140 @@ class VerifyIntervalTests(unittest.TestCase):
         self.assertFalse(audit.is_hex_digest(None))
 
 
+def build_delta_rows(n, *, start=1):
+    """构造 n 条增量快照行：state 为 None（待还原），链摘要按真实状态计算。
+
+    返回 (rows, states)：states[i] 为第 i 条应还原出的完整冻结状态。
+    """
+    rows = build_rows(n, start=start)
+    states = [r["state"] for r in rows]
+    for r in rows:
+        r["state"] = None
+        r["base_snapshot_id"] = r["id"] - 1
+        r["delta"] = {"format": "water-snapshot-delta/v1"}
+    return rows, states
+
+
+class VerifyIntervalDeltaRestoreTests(unittest.TestCase):
+    """增量行按需还原（resolve_state）相关核验行为（纯算法）。"""
+
+    def test_unrestorable_delta_reports_content_corrupted_at_that_row(self):
+        rows, states = build_delta_rows(4)
+
+        def resolve(row):
+            if row["id"] == rows[2]["id"]:
+                raise audit.SnapshotStateUnrestorable(
+                    row["id"], "未知的快照增量格式：water-snapshot-delta/v9"
+                )
+            return states[next(i for i, r in enumerate(rows) if r["id"] == row["id"])]
+
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+            resolve_state=resolve,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["kind"], "content_corrupted")
+        self.assertEqual(r["failure"]["snapshot_id"], rows[2]["id"])
+        self.assertEqual(
+            [d["snapshot_id"] for d in r["digests"]],
+            [rows[0]["id"], rows[1]["id"]],
+        )
+        self.assertIn("无法还原", r["failure"]["message"])
+        # 还原不出内容时无法给出应重算摘要，但链上实际摘要仍回显
+        self.assertIsNone(r["failure"]["expected_digest"])
+        self.assertEqual(
+            r["failure"]["actual_digest"], rows[2]["stored_digest"]
+        )
+
+    def test_first_unrestorable_delta_is_reported_when_multiple_bad(self):
+        rows, states = build_delta_rows(4)
+
+        def resolve(row):
+            idx = row["id"] - rows[0]["id"]
+            if idx in (1, 2):  # 第 2、3 条都损坏
+                raise audit.SnapshotStateUnrestorable(row["id"], "坏格式")
+            return states[idx]
+
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+            resolve_state=resolve,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], rows[1]["id"])
+        self.assertEqual([d["snapshot_id"] for d in r["digests"]], [rows[0]["id"]])
+
+    def test_restored_states_verify_ok_including_first_delta(self):
+        # 合法的全量+增量混合区间：首条为增量、其基准在区间之外（resolve 透明处理）
+        rows, states = build_delta_rows(3)
+        by_id = {r["id"]: s for r, s in zip(rows, states)}
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=rows[0]["stored_prev_digest"],
+            end_digest=rows[-1]["stored_digest"],
+            resolve_state=lambda row: by_id[row["id"]],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_OK, r.get("failure"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(
+            [d["snapshot_id"] for d in r["digests"]], [r["id"] for r in rows]
+        )
+
+    def test_earlier_chain_break_takes_precedence_over_unrestorable_delta(self):
+        rows, states = build_delta_rows(4)
+        # 第 3 条链指针被改（链断），且第 3 条本身也无法还原：必须报更早的链断
+        rows[2]["stored_prev_digest"] = "9" * 64
+
+        def resolve(row):
+            idx = row["id"] - rows[0]["id"]
+            if idx == 2:
+                raise audit.SnapshotStateUnrestorable(row["id"], "坏格式")
+            return states[idx]
+
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+            resolve_state=resolve,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CHAIN_BROKEN)
+        self.assertEqual(r["failure"]["snapshot_id"], rows[2]["id"])
+        self.assertEqual([d["snapshot_id"] for d in r["digests"]],
+                         [rows[0]["id"], rows[1]["id"]])
+
+    def test_unrestorable_first_row_still_internal_corruption_not_boundary(self):
+        # 首条增量无法还原 + 起点前边界摘要也给错：仍报内容损坏（内部问题优先）
+        rows, states = build_delta_rows(2)
+
+        def resolve(row):
+            if row["id"] == rows[0]["id"]:
+                raise audit.SnapshotStateUnrestorable(row["id"], "坏格式")
+            return states[1]
+
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest="a" * 64,
+            end_digest=rows[-1]["stored_digest"],
+            resolve_state=resolve,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], rows[0]["id"])
+        self.assertEqual(r["digests"], [])
+
+    def test_delta_row_without_resolver_is_content_corrupted_fail_closed(self):
+        # 无还原器却出现 state=None 的增量行：fail-closed 报内容损坏，绝不静默通过
+        rows, _states = build_delta_rows(1)
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=rows[0]["stored_prev_digest"],
+            end_digest=rows[0]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], rows[0]["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

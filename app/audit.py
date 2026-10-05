@@ -27,12 +27,26 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 # 链编码版本标识：写入创世输入、信封与核验规则，改动即构成新链
 CHAIN_TAG = "water-snapshot-chain/v1"
 GENESIS_INPUT = f"{CHAIN_TAG}:genesis".encode("utf-8")
 GENESIS_DIGEST = hashlib.sha256(GENESIS_INPUT).hexdigest()
+
+
+class SnapshotStateUnrestorable(Exception):
+    """增量快照的完整冻结状态无法沿基准链还原（增量格式未知、载荷被破坏、
+    基准悬空/成环等）。
+
+    由数据访问层的按需还原器抛出；verify_interval 捕获后把**正在核验的
+    该条快照**定位为 content_corrupted，而不是让异常冒泡成服务器错误。
+    """
+
+    def __init__(self, snapshot_id: int, reason: str):
+        self.snapshot_id = snapshot_id
+        self.reason = reason
+        super().__init__(f"快照 {snapshot_id} 无法还原完整冻结状态：{reason}")
 
 # 核验结论（HTTP 始终 200，结论在 verdict 中）
 VERDICT_OK = "ok"                    # 内部自洽，且起点前/终点边界摘要均相符
@@ -136,6 +150,7 @@ def verify_interval(
     *,
     pre_start_digest: str,
     end_digest: str,
+    resolve_state: Callable[[dict], Any] | None = None,
 ) -> dict:
     """只读核验一段连续取出的快照行（编号升序、含链路摘要列）。
 
@@ -143,6 +158,11 @@ def verify_interval(
       - stored_digest：建链时写入的摘要；无链行（未入链）时为 None
       - stored_prev_digest：建链时写入的前一条摘要；无链行时为 None
 
+    增量行的 state 允许为 None（未预先还原）。此时 **resolve_state** 负责
+    按该条快照（可沿其基准链，基准允许在区间之外）按需还原完整冻结状态；
+    还原失败（例如 delta.format 被改成未知版本）须抛出
+    :class:`SnapshotStateUnrestorable`，核验即把该条定位为内容损坏。
+    resolve_state 为 None 时按行内已有 state 核验（纯算法场景）。
     本函数不做端点存在性/倒序检查（由路由层负责）。返回结构：
 
       {
@@ -168,9 +188,11 @@ def verify_interval(
       1. 无链行（stored_digest 为 None）→ 链路断裂（该条）；
       2. 从第二条起，stored_prev_digest 必须等于上一条现存快照的
          stored_digest；不符 → 链路断裂（该条）；
-      3. 用**存储的**前一条摘要重算内容摘要，与 stored_digest 不符 → 内容损坏。
-         区间首条与入参 pre_start_digest 的比对属于**边界**，不在这里判定，
-         因此审计员给错起点前摘要不会被误报为内容损坏；
+      3. 按需还原该条完整状态（增量行沿基准链，基准可在区间外），
+         无法还原（未知 delta 格式等）→ 内容损坏（该条）；
+         再用**存储的**前一条摘要重算内容摘要，与 stored_digest 不符 →
+         内容损坏。区间首条与入参 pre_start_digest 的比对属于**边界**，
+         不在这里判定，因此审计员给错起点前摘要不会被误报为内容损坏；
       4. 内部链全部自洽后，再比较起点前 / 终点两条边界摘要；仅边界不符时
          verdict=boundary_mismatch，failure 只描述边界。
     """
@@ -241,7 +263,40 @@ def verify_interval(
             return result
 
         # 3) 以存储的 prev_digest 重算：内容是否被事后改写只取决于
-        #    “按链上记录的链接重算能否复现链上记录的摘要”
+        #    “按链上记录的链接重算能否复现链上记录的摘要”。
+        #    增量行先按需还原完整冻结状态（基准可在区间之外）；还原失败
+        #    （如 delta.format 被改成未知版本）本身就是可定位的内容损坏。
+        if row.get("state") is None:
+            if resolve_state is None:
+                restore_error = SnapshotStateUnrestorable(
+                    sid, "该条为增量快照但未提供状态还原器"
+                )
+            else:
+                try:
+                    restored_state = resolve_state(row)
+                except SnapshotStateUnrestorable as exc:
+                    restore_error = exc
+                else:
+                    restore_error = (
+                        None if restored_state is not None
+                        else SnapshotStateUnrestorable(sid, "状态还原结果为空")
+                    )
+            if restore_error is not None:
+                result["verdict"] = VERDICT_CONTENT_CORRUPTED
+                result["failure"] = {
+                    "kind": VERDICT_CONTENT_CORRUPTED,
+                    "snapshot_id": sid,
+                    "previous_snapshot_id": prev_id,
+                    "expected_digest": None,
+                    "actual_digest": stored.lower(),
+                    "message": (
+                        f"快照 {sid} 的完整冻结状态无法还原，"
+                        f"增量内容已被改写或损坏（{restore_error.reason}）"
+                    ),
+                }
+                return result
+            row = {**row, "state": restored_state}
+
         recompute_prev = stored_prev.lower() if stored_prev else expected_prev
         recomputed = compute_snapshot_digest(row, recompute_prev)
         if recomputed != stored.lower():

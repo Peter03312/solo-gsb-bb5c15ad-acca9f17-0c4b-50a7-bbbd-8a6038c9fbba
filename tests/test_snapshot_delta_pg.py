@@ -18,6 +18,7 @@ monkeypatch 的真实 app.db 副本。
     RUN_DB_TESTS=1 python3 -m unittest tests.test_snapshot_delta_pg -v
 """
 import os
+import json
 import unittest
 
 import psycopg2
@@ -225,6 +226,112 @@ class SnapshotDeltaPostgresTests(unittest.TestCase):
             end_digest=rows[-1]["stored_digest"],
         )
         self.assertEqual(result["verdict"], audit.VERDICT_OK, result.get("failure"))
+
+    def test_unknown_delta_format_reports_content_corrupted_not_500(self):
+        # 区间内某条增量的 delta.format 被事后改成未知版本：核验须在 HTTP 200
+        # 结构内把该条定位为 content_corrupted，而不是在还原阶段抛服务器错误。
+        version, snap_import = self._import()
+        out = self._submit(version)  # 增量快照（基准为区间外全量）
+        snap_bad = out["snapshot_id"]
+        with db.transaction() as conn:
+            out = db.confirm_restore(
+                conn, out["event_id"], out["version"], ["V1"], ["U1"]
+            )
+        snap_after = out["snapshot_id"]
+
+        bad_digest = _raw_row(snap_bad)[1][0]
+        after_digest = _raw_row(snap_after)[1][0]
+        pre_digest = _prev_chain_digest(snap_import)
+
+        # 直接改库（绕过服务）：把损坏增量的 format 改成未知版本
+        conn = psycopg2.connect(get_settings().database_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE state_snapshots "
+                    "SET delta = jsonb_set(delta, '{format}', %s::jsonb) "
+                    "WHERE id = %s",
+                    (json.dumps("water-snapshot-delta/v9"), snap_bad),
+                )
+        finally:
+            conn.close()
+
+        with db.read_transaction() as conn:
+            rows = db.fetch_snapshot_chain_rows_raw(conn, snap_import, snap_after)
+            resolver = db.make_chain_row_state_resolver(conn)
+            result = audit.verify_interval(
+                rows,
+                pre_start_digest=pre_digest,
+                end_digest=after_digest,
+                resolve_state=resolver,
+            )
+
+        self.assertEqual(result["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        failure = result["failure"]
+        self.assertEqual(failure["kind"], "content_corrupted")
+        self.assertEqual(failure["snapshot_id"], snap_bad)
+        self.assertIn("无法还原", failure["message"])
+        # digests 只含损坏点之前已核验通过的快照（全量首条）
+        self.assertEqual(
+            [d["snapshot_id"] for d in result["digests"]], [snap_import]
+        )
+        self.assertEqual(failure["actual_digest"], bad_digest)
+        self.assertIsNone(failure["expected_digest"])
+
+        # 损坏增量在子区间首条（区间内首条即损坏）：同样定位该条
+        with db.read_transaction() as conn:
+            rows = db.fetch_snapshot_chain_rows_raw(conn, snap_bad, snap_after)
+            resolver = db.make_chain_row_state_resolver(conn)
+            result = audit.verify_interval(
+                rows,
+                pre_start_digest=bad_digest,
+                end_digest=after_digest,
+                resolve_state=resolver,
+            )
+        self.assertEqual(result["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(result["failure"]["snapshot_id"], snap_bad)
+        self.assertEqual(result["digests"], [])
+
+    def test_corrupted_base_outside_interval_reported_on_first_interval_delta(self):
+        # 区间首条增量的基准（全量）之后的增量在区间外被改坏：
+        # 区间内首条无法沿基准链还原 -> content_corrupted 指向区间首条。
+        version, snap_import = self._import()
+        out = self._submit(version)
+        snap_outside = out["snapshot_id"]  # 区间外的坏增量
+        with db.transaction() as conn:
+            out = db.confirm_restore(
+                conn, out["event_id"], out["version"], ["V1"], ["U1"]
+            )
+        snap_inside = out["snapshot_id"]   # 区间首条（基准链经过坏增量）
+
+        conn = psycopg2.connect(get_settings().database_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE state_snapshots "
+                    "SET delta = jsonb_set(delta, '{format}', %s::jsonb) "
+                    "WHERE id = %s",
+                    (json.dumps("water-snapshot-delta/v9"), snap_outside),
+                )
+        finally:
+            conn.close()
+
+        with db.read_transaction() as conn:
+            rows = db.fetch_snapshot_chain_rows_raw(
+                conn, snap_inside, snap_inside
+            )
+            resolver = db.make_chain_row_state_resolver(conn)
+            result = audit.verify_interval(
+                rows,
+                pre_start_digest=_raw_row(snap_inside)[1][1],
+                end_digest=_raw_row(snap_inside)[1][0],
+                resolve_state=resolver,
+            )
+        self.assertEqual(result["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(result["failure"]["snapshot_id"], snap_inside)
+        self.assertEqual(result["digests"], [])
 
     def test_diff_across_delta_snapshots(self):
         version, snap_import = self._import()

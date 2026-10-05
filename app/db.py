@@ -713,8 +713,13 @@ def _resolve_state_and_depth(conn, row: dict) -> tuple[dict, int]:
 
 
 def _resolve_row_state(conn, row: dict, cache: dict[int, dict],
-                       by_id: dict[int, dict] | None = None) -> dict:
-    """还原一行的完整冻结状态（带跨行缓存；by_id 可复用同批已取出的行）。"""
+                       by_id: dict[int, dict] | None = None,
+                       storage_lookup=None) -> dict:
+    """还原一行的完整冻结状态（带跨行缓存；by_id/storage_lookup 可复用已取出行）。
+
+    storage_lookup 给定时按编号取基准行（可带调用方自身缓存）；否则退回
+    by_id 同批字典，再否则直接查询。
+    """
     if row["state"] is not None:
         return _decode_jsonb(row["state"])
     cached = cache.get(row["id"])
@@ -733,7 +738,10 @@ def _resolve_row_state(conn, row: dict, cache: dict[int, dict],
                 f"{SNAPSHOT_DELTA_MAX_DEPTH} 层仍未到达全量快照"
             )
         base_id = current["base_snapshot_id"]
-        current = (by_id or {}).get(base_id) or _fetch_storage_row(conn, base_id)
+        if storage_lookup is not None:
+            current = storage_lookup(base_id)
+        else:
+            current = (by_id or {}).get(base_id) or _fetch_storage_row(conn, base_id)
         if current is None:
             raise RuntimeError(
                 f"增量快照 {chain[-1]['id']} 的基准快照 {base_id} 不存在"
@@ -1098,12 +1106,26 @@ def state_snapshot_exists(conn, snapshot_id: int) -> bool:
 
 
 def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
-    """只读取出闭区间 [start_id, end_id] 内**实际存在**的快照及链摘要。
+    """只读取出闭区间 [start_id, end_id] 内**实际存在**的快照及链摘要，
+    并就地还原增量行的完整冻结状态（供按完整状态计算摘要的调用方使用）。
+
+    审计区间核验改用 :func:`fetch_snapshot_chain_rows_raw` 配合
+    :func:`make_chain_row_state_resolver`，只在核验走到某条时才按需还原，
+    使损坏的增量格式能被定位到具体快照而不是整体报错。
+    """
+    rows = fetch_snapshot_chain_rows_raw(conn, start_id, end_id)
+    _resolve_rows(conn, rows)
+    return rows
+
+
+def fetch_snapshot_chain_rows_raw(conn, start_id: int, end_id: int) -> list[dict]:
+    """只读取出闭区间 [start_id, end_id] 内**实际存在**的快照及链摘要（原始行）。
 
     按编号升序；回滚造成的编号空洞自然不产生行（核验时不算断链）。
     LEFT JOIN 使缺少链记录的快照（被外部破坏）也能返回，由核验逻辑定位
-    为链路断裂，而不是静默忽略。返回项含 stored_digest / stored_prev_digest。
-    增量行的 state 已沿基准链（可能延伸到区间起点之前）还原为完整冻结状态。
+    为链路断裂，而不是静默忽略。返回项含 stored_digest / stored_prev_digest；
+    增量行的 state 为 None（连同 base_snapshot_id / delta 原样返回），
+    由 :func:`make_chain_row_state_resolver` 产出的还原器按需还原。
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -1117,5 +1139,36 @@ def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
             (start_id, end_id),
         )
         rows = cur.fetchall()
-    _resolve_rows(conn, rows)
     return [dict(r) for r in rows]
+
+
+def make_chain_row_state_resolver(conn):
+    """产出供 ``audit.verify_interval`` 按需还原增量行完整状态的还原器。
+
+    还原只走只读 SELECT（绝不改快照/摘要链/当前管网），沿 base_snapshot_id
+    回溯到最近全量快照再正向套用增量；基准允许落在核验区间之外。任何
+    还原失败（未知 delta 格式、载荷被破坏、基准悬空/成环）都统一翻译为
+    :class:`audit.SnapshotStateUnrestorable`（携带被核验快照编号），
+    由核验逻辑报为该条 content_corrupted，而不是冒泡成服务器错误。
+
+    纯数据库故障（连接/查询错误）原样抛出，不冒充内容损坏。
+    """
+    cache: dict[int, dict] = {}
+    fetched: dict[int, dict] = {}
+
+    def storage_row(snapshot_id: int) -> dict | None:
+        if snapshot_id not in fetched:
+            fetched[snapshot_id] = _fetch_storage_row(conn, snapshot_id)
+        return fetched[snapshot_id]
+
+    def resolve(row: dict) -> dict:
+        if row["state"] is not None:
+            return _decode_jsonb(row["state"])
+        try:
+            return _resolve_row_state(conn, row, cache, storage_lookup=storage_row)
+        except psycopg2.Error:
+            raise
+        except Exception as exc:  # 未知增量格式/坏载荷/悬空成环等：fail-closed
+            raise audit.SnapshotStateUnrestorable(row["id"], str(exc)) from exc
+
+    return resolve

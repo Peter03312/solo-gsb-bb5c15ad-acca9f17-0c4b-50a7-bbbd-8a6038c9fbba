@@ -395,7 +395,10 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   闭区间内现存快照并逐条重算，返回区间内各条摘要与**首个可定位**的问题：
   - `content_corrupted`：某条冻结内容（编号/操作/版本/事件/时间/完整状态）被事后
     改写——按存储链接重算的摘要与链上摘要不符，`failure.snapshot_id` 即损坏位置，
-    `digests` 只含损坏点之前已核验通过的条目；
+    `digests` 只含损坏点之前已核验通过的条目；**增量快照的 delta 载荷被改成未知
+    格式（或基准链悬空/成环）而无法还原完整冻结状态时，同样在 HTTP 200 结构内
+    定位为该条 `content_corrupted`**（`failure.message` 说明还原失败原因，
+    `expected_digest` 为 null、`actual_digest` 为链上摘要），不再抛服务器错误；
   - `chain_broken`：某条的前一条摘要指针与上一条现存快照摘要不符（或链记录缺失），
     `failure` 同时给出应有/实际前驱摘要与上一条现存快照编号；
   - `boundary_mismatch`：**内部链自洽**，但审计员提供的起点前或终点摘要与链上记录
@@ -1062,6 +1065,11 @@ curl -s -X POST http://localhost:8000/api/audit/verify \
 - `ok`：区间内逐条重算全部相符，且两条边界摘要均与事先保存值相符；
 - `content_corrupted`：首个被改写的快照编号（冻结的编号/操作/版本/事件/时间/
   完整状态任一字段变化都会使重算摘要不符），`digests` 只含损坏点之前的条目；
+  若区间内某条**增量快照**的 `delta.format` 被事后改成未知版本（或基准链悬空/
+  成环）导致完整状态无法还原，也在 HTTP 200 内报为该条 `content_corrupted`：
+  `failure.snapshot_id` 指向首条无法还原的增量，`failure.message` 给出还原失败
+  原因，`failure.expected_digest` 为 `null`、`failure.actual_digest` 为其链上摘要，
+  `digests` 仍只含此前核验通过的条目（此前已有断链/损坏时优先报告更早的问题）；
 - `chain_broken`：首个断链位置（前驱摘要指针不符或链记录缺失，含上一条现存编号
   与应有/实际前驱摘要）；回滚造成的编号空洞不算断链；
 - `boundary_mismatch`：内部链自洽，仅起点前或终点边界摘要不符，
@@ -1069,6 +1077,40 @@ curl -s -X POST http://localhost:8000/api/audit/verify \
 
 错误约定：端点（含回滚空洞）不存在 → `404 SNAPSHOT_NOT_FOUND`；
 区间倒序 → `422 AUDIT_RANGE_INVALID`；摘要格式非法 → `422 AUDIT_DIGEST_INVALID`。
+
+增量快照的 `delta.format` 被改成未知版本时的响应（**请求字段、路径与 HTTP 200
+结构均不变**；合法的全量/增量混合区间——包括首条增量的基准在区间之外——照常
+按完整冻结状态核验并给出 `ok` / `boundary_mismatch` / `chain_broken`）：
+
+```json
+{
+  "ok": false,
+  "verdict": "content_corrupted",
+  "start_snapshot_id": 1,
+  "end_snapshot_id": 3,
+  "genesis_digest": "13ffb519ed1f000b83d4fc715feb79da314f24b5d2a7ceb6c06ba083bf05e714",
+  "pre_start_digest": "13ffb519ed1f000b83d4fc715feb79da314f24b5d2a7ceb6c06ba083bf05e714",
+  "end_digest": "4f2a9c7e8b1d6a3f5c0e2b9a7d4f1c8e6b3a0d2f5c8e1b4a7d0f3c6e9b2a5d8f",
+  "expected_pre_start_digest": null,
+  "expected_end_digest": null,
+  "start_boundary_ok": null,
+  "end_boundary_ok": null,
+  "failure": {
+    "kind": "content_corrupted",
+    "snapshot_id": 3,
+    "previous_snapshot_id": 2,
+    "expected_digest": null,
+    "actual_digest": "7a1c...（链上存储的摘要）",
+    "expected_prev_digest": null,
+    "actual_prev_digest": null,
+    "message": "快照 3 的完整冻结状态无法还原，增量内容已被改写或损坏（未知的快照增量格式：water-snapshot-delta/v9）"
+  },
+  "digests": [
+    {"snapshot_id": 1, "digest": "9c1d...", "prev_digest": "13ff..."},
+    {"snapshot_id": 2, "digest": "5b8e...", "prev_digest": "9c1d..."}
+  ]
+}
+```
 
 ```bash
 python3 examples/audit_chain_demo.py

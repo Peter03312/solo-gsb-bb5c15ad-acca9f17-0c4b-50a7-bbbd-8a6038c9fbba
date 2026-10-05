@@ -406,6 +406,17 @@ def fake_state_snapshot_exists(conn, snapshot_id):
 
 
 def fake_list_snapshot_chain_rows(conn, start_id, end_id):
+    rows = fake_fetch_snapshot_chain_rows_raw(conn, start_id, end_id)
+    # 与真实 db 层一致：直接读取方拿到还原后的完整状态
+    resolve = fake_make_chain_row_state_resolver_from(rows)
+    for row in rows:
+        if row["state"] is None:
+            row["state"] = resolve(row)
+    return rows
+
+
+def fake_fetch_snapshot_chain_rows_raw(conn, start_id, end_id):
+    """核验专用：返回未还原的原始行（增量行 state=None，含 base/delta 列）。"""
     snapshots = _snapshots_view()
     chains = _chains_view()
     rows = []
@@ -420,6 +431,53 @@ def fake_list_snapshot_chain_rows(conn, start_id, end_id):
                 }
             )
     return rows
+
+
+def fake_make_chain_row_state_resolver(conn):
+    """核验专用还原器：从只读视图的全部现存快照里按基准链按需还原增量行。"""
+    return fake_make_chain_row_state_resolver_from(
+        [copy.deepcopy(s) for s in _snapshots_view()]
+    )
+
+
+def fake_make_chain_row_state_resolver_from(snapshots):
+    """按一批快照行构造增量状态还原器（复刻 db.make_chain_row_state_resolver）。
+
+    未知 delta 格式等任何还原失败都翻译为 audit.SnapshotStateUnrestorable，
+    使损坏被定位到被核验的该条快照，而不是冒泡成服务器错误。
+    """
+    from app.planning import apply_snapshot_state_delta
+
+    by_id = {s["id"]: s for s in snapshots}
+    cache: dict = {}
+
+    def resolve(row):
+        if row["state"] is not None:
+            return row["state"]
+        if row["id"] in cache:
+            return cache[row["id"]]
+        chain = []
+        current = row
+        while current["state"] is None:
+            chain.append(current)
+            current = by_id.get(current.get("base_snapshot_id"))
+            if current is None:
+                raise audit.SnapshotStateUnrestorable(
+                    chain[-1]["id"],
+                    f"基准快照 {chain[-1].get('base_snapshot_id')} 不存在",
+                )
+        state = copy.deepcopy(current["state"])
+        for delta_row in reversed(chain):
+            try:
+                state = apply_snapshot_state_delta(state, delta_row["delta"])
+            except Exception as exc:
+                raise audit.SnapshotStateUnrestorable(
+                    delta_row["id"], str(exc)
+                ) from exc
+            cache[delta_row["id"]] = state
+        return state
+
+    return resolve
 
 
 def fake_get_chain_info(conn):
@@ -457,6 +515,8 @@ db.get_previous_state_snapshot = fake_get_previous_state_snapshot
 db.get_snapshot_storage = fake_get_snapshot_storage
 db.state_snapshot_exists = fake_state_snapshot_exists
 db.list_snapshot_chain_rows = fake_list_snapshot_chain_rows
+db.fetch_snapshot_chain_rows_raw = fake_fetch_snapshot_chain_rows_raw
+db.make_chain_row_state_resolver = fake_make_chain_row_state_resolver
 db.get_chain_info = fake_get_chain_info
 
 
@@ -3508,6 +3568,131 @@ class SnapshotChainAuditTests(unittest.TestCase):
         self.assertEqual(
             [d["snapshot_id"] for d in body["digests"]], ids[:1]
         )
+
+    def _craft_delta_snapshot(self, base_id, state, *, network_version=2):
+        """手工制造一条引用 base_id 的增量快照（链摘要按还原后的完整状态计算）。
+
+        基准（自身也可能是增量）的完整状态用测试还原器按需还原；调用时
+        基准链须仍完好（损坏在造好快照之后再施加）。
+        """
+        import datetime
+
+        from app.planning import snapshot_state_delta
+
+        base_row = next(s for s in _snapshots_view() if s["id"] == base_id)
+        base_resolver = fake_make_chain_row_state_resolver_from(
+            [copy.deepcopy(s) for s in _snapshots_view()]
+        )
+        base_state = base_resolver(copy.deepcopy(base_row))
+        sid = STORE.next_snapshot_id
+        STORE.next_snapshot_id += 1
+        created_at = datetime.datetime(2026, 9, 30, 12, 0, 0)
+        STORE.snapshots.append(
+            {
+                "id": sid,
+                "op_type": "source_switch",
+                "network_version": network_version,
+                "event_id": None,
+                "state": None,
+                "base_snapshot_id": base_id,
+                "delta": snapshot_state_delta(base_state, state),
+                "created_at": created_at,
+            }
+        )
+        prev_digest = STORE.chains[base_id]["digest"]
+        digest = audit.snapshot_digest(
+            snapshot_id=sid,
+            op_type="source_switch",
+            network_version=network_version,
+            event_id=None,
+            created_at=created_at,
+            state=state,
+            prev_digest=prev_digest,
+        )
+        STORE.chains[sid] = {"digest": digest, "prev_digest": prev_digest}
+        return sid
+
+    def test_verify_delta_format_unknown_reports_content_corrupted_http_200(self):
+        # 全量 + 增量混合区间；中间增量的 delta.format 被事后改为未知版本：
+        # 旧实现整体还原抛 ValueError -> 500；修复后定位该条 content_corrupted
+        ids = self._make_chain(1)  # 全量首条
+        full_state = copy.deepcopy(STORE.snapshots[-1]["state"])
+        good_state = {**full_state, "supplied_sink_ids": ["U1"]}
+        bad_state = {**good_state, "supplied_sink_ids": ["U1", "U2"]}
+        sid_delta_good = self._craft_delta_snapshot(ids[0], good_state)
+        sid_delta_bad = self._craft_delta_snapshot(sid_delta_good, bad_state)
+
+        target = next(s for s in STORE.snapshots if s["id"] == sid_delta_bad)
+        target["delta"] = {**target["delta"], "format": "water-snapshot-delta/v9"}
+
+        end_digest = STORE.chains[sid_delta_bad]["digest"]
+        r = self._verify(ids[0], sid_delta_bad, audit.GENESIS_DIGEST, end_digest)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["verdict"], "content_corrupted")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["failure"]["kind"], "content_corrupted")
+        self.assertEqual(body["failure"]["snapshot_id"], sid_delta_bad)
+        self.assertIn("无法还原", body["failure"]["message"])
+        # digests 仅含此前核验通过的快照（全量 + 好的增量），损坏条不在其中
+        self.assertEqual(
+            [d["snapshot_id"] for d in body["digests"]],
+            [ids[0], sid_delta_good],
+        )
+
+    def test_verify_valid_full_delta_mix_with_base_outside_interval_ok(self):
+        # 合法混合区间：核验区间首条为增量，其基准全量快照在区间之外 -> ok
+        ids = self._make_chain(1)
+        state_a = {**STORE.snapshots[-1]["state"], "supplied_sink_ids": ["U1"]}
+        state_b = {**state_a, "supplied_sink_ids": ["U1", "U2"]}
+        sid_a = self._craft_delta_snapshot(ids[0], state_a)
+        sid_b = self._craft_delta_snapshot(sid_a, state_b)
+        pre = STORE.chains[sid_a]["prev_digest"]
+        end_digest = STORE.chains[sid_b]["digest"]
+        r = self._verify(sid_a, sid_b, pre, end_digest)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["verdict"], "ok")
+        self.assertTrue(body["ok"])
+        self.assertEqual(
+            [d["snapshot_id"] for d in body["digests"]], [sid_a, sid_b]
+        )
+
+    def test_verify_delta_restore_failure_keeps_earlier_chain_break(self):
+        # 更早的链指针断裂 + 该条 delta 同时损坏：仍报告更早的链断
+        ids = self._make_chain(1)
+        state_a = {**STORE.snapshots[-1]["state"], "supplied_sink_ids": ["U1"]}
+        sid_a = self._craft_delta_snapshot(ids[0], state_a)
+        STORE.chains[sid_a]["prev_digest"] = "9" * 64  # 链指针先断
+        target = next(s for s in STORE.snapshots if s["id"] == sid_a)
+        target["delta"] = {**target["delta"], "format": "water-snapshot-delta/v9"}
+
+        end_digest = STORE.chains[sid_a]["digest"]
+        r = self._verify(ids[0], sid_a, audit.GENESIS_DIGEST, end_digest)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["verdict"], "chain_broken")
+        self.assertEqual(body["failure"]["snapshot_id"], sid_a)
+        self.assertEqual([d["snapshot_id"] for d in body["digests"]], ids)
+
+    def test_verify_unknown_delta_format_is_read_only(self):
+        ids = self._make_chain(1)
+        state_a = {**STORE.snapshots[-1]["state"], "supplied_sink_ids": ["U1"]}
+        sid_a = self._craft_delta_snapshot(ids[0], state_a)
+        before_delta = copy.deepcopy(
+            next(s for s in STORE.snapshots if s["id"] == sid_a)["delta"]
+        )
+        before_chains = copy.deepcopy(STORE.chains)
+        target = next(s for s in STORE.snapshots if s["id"] == sid_a)
+        target["delta"] = {**target["delta"], "format": "water-snapshot-delta/v9"}
+        self._verify(ids[0], sid_a, audit.GENESIS_DIGEST,
+                     STORE.chains[sid_a]["digest"])
+        # 核验不改写快照（损坏的 format 原样保留）或摘要链
+        self.assertEqual(
+            next(s for s in STORE.snapshots if s["id"] == sid_a)["delta"],
+            {**before_delta, "format": "water-snapshot-delta/v9"},
+        )
+        self.assertEqual(STORE.chains, before_chains)
 
     def test_verify_chain_break_is_located(self):
         ids = self._make_chain(3)
