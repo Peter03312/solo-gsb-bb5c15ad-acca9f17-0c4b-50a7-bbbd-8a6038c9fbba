@@ -395,13 +395,18 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   闭区间内现存快照并逐条重算，返回区间内各条摘要与**首个可定位**的问题：
   - `content_corrupted`：某条冻结内容（编号/操作/版本/事件/时间/完整状态）被事后
     改写——按存储链接重算的摘要与链上摘要不符，`failure.snapshot_id` 即损坏位置，
-    `digests` 只含损坏点之前已核验通过的条目；
+    `digests` 只含损坏点之前已核验通过的条目；某条**增量快照无法沿基准链还原**
+    （如 `delta.format` 被事后改为未知版本、基准快照缺失）同样按内容损坏定位到
+    该条——此时无法重算摘要，`failure.expected_digest` 为 `null`，接口仍以
+    HTTP 200 返回定位结果而**不再返回服务器错误**；
   - `chain_broken`：某条的前一条摘要指针与上一条现存快照摘要不符（或链记录缺失），
     `failure` 同时给出应有/实际前驱摘要与上一条现存快照编号；
   - `boundary_mismatch`：**内部链自洽**，但审计员提供的起点前或终点摘要与链上记录
     不符（`start_boundary_ok` / `end_boundary_ok` 分别标明），只报告边界不符，
     并在 `expected_pre_start_digest` / `expected_end_digest` 回显链上真实值；
   - `ok`：区间自洽且两条边界摘要均相符；
+  同一区间内按编号顺序逐条判定，**首个**问题即停止：若无法还原的增量快照之前
+  已存在链路断裂或内容损坏，报告的是更早的那一处；
 - 核验区间端点（含回滚空洞编号）**不存在**返回 `404 SNAPSHOT_NOT_FOUND`；
   起止倒序返回 `422 AUDIT_RANGE_INVALID`；摘要非 64 位十六进制返回
   `422 AUDIT_DIGEST_INVALID`；核验全程只读，不写版本/阀位/事件/快照/链；
@@ -1062,10 +1067,53 @@ curl -s -X POST http://localhost:8000/api/audit/verify \
 - `ok`：区间内逐条重算全部相符，且两条边界摘要均与事先保存值相符；
 - `content_corrupted`：首个被改写的快照编号（冻结的编号/操作/版本/事件/时间/
   完整状态任一字段变化都会使重算摘要不符），`digests` 只含损坏点之前的条目；
+  **增量快照无法还原**（如 `delta.format` 被事后改为未知版本）也按此结论定位到
+  首条无法还原的快照，此时 `failure.expected_digest` 为 `null`（无法重算），
+  `failure.actual_digest` 为链上记录值，接口仍返回 200 而非服务器错误；
 - `chain_broken`：首个断链位置（前驱摘要指针不符或链记录缺失，含上一条现存编号
   与应有/实际前驱摘要）；回滚造成的编号空洞不算断链；
 - `boundary_mismatch`：内部链自洽，仅起点前或终点边界摘要不符，
   `start_boundary_ok` / `end_boundary_ok` 分别标明哪一侧不符。
+
+区间内按编号顺序逐条判定、首个问题即停止：无法还原的增量快照之前若已有
+链路断裂或内容损坏，报告更早的那一处。
+
+增量快照的 `delta.format` 被事后改为未知版本时的响应示例
+（请求字段不变；正常 API 没有改写快照的路径，此处为直改数据库后的核验结果）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/audit/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_id": 1,
+    "end_id": 3,
+    "pre_start_digest": "13ffb519ed1f000b83d4fc715feb79da314f24b5d2a7ceb6c06ba083bf05e714",
+    "end_digest": "4f2a9c7e8b1d6a3f5c0e2b9a7d4f1c8e6b3a0d2f5c8e1b4a7d0f3c6e9b2a5d8f"
+  }'
+```
+
+```json
+{
+  "ok": false,
+  "verdict": "content_corrupted",
+  "start_snapshot_id": 1,
+  "end_snapshot_id": 3,
+  "failure": {
+    "kind": "content_corrupted",
+    "snapshot_id": 2,
+    "previous_snapshot_id": 1,
+    "expected_digest": null,
+    "actual_digest": "bd2c12bfcd51384122b7c2a1d934940caa9e23050794943418e94449d1d77a0e",
+    "message": "快照 2 的冻结状态无法沿基准链还原（未知的快照增量格式：water-snapshot-delta/v999），内容已被改写或损坏"
+  },
+  "digests": [
+    {"snapshot_id": 1, "digest": "9c1d0000000000000000000000000000000000000000000000000000000000ab", "prev_digest": "13ffb519ed1f000b83d4fc715feb79da314f24b5d2a7ceb6c06ba083bf05e714"}
+  ]
+}
+```
+
+（其余字段与 `ok` 响应相同，此处省略；`digests` 只含损坏点之前已核验通过的
+快照 1。）
 
 错误约定：端点（含回滚空洞）不存在 → `404 SNAPSHOT_NOT_FOUND`；
 区间倒序 → `422 AUDIT_RANGE_INVALID`；摘要格式非法 → `422 AUDIT_DIGEST_INVALID`。
@@ -1079,7 +1127,10 @@ python3 examples/audit_chain_demo.py http://localhost:8000
 脚本依次演示：制造快照 → 读取链信息 → 用事先保存的边界摘要全区间核验通过 →
 终点摘要不符只报 boundary_mismatch → 端点不存在、区间倒序、摘要格式非法的报错。
 内容损坏/链路断裂需直接改写数据库才能复现（正常 API 没有任何改写快照的路径），
-其定位逻辑由 `tests/test_audit.py` 覆盖。
+其定位逻辑由 `tests/test_audit.py` 覆盖；增量快照 `delta.format` 被改为未知版本
+导致无法还原时的 `content_corrupted` 定位（HTTP 200 而非 500）由
+`tests/test_audit.py`、`tests/test_api.py` 与真实库回归
+`tests/test_snapshot_delta_pg.py` 共同覆盖。
 
 ### 12. 用水点最低流量核算（只读）
 
@@ -1672,7 +1723,10 @@ python3 examples/consistent_read_demo.py http://localhost:8000
 - **透明还原**：按编号读取、列表、相邻对照、审计区间核验都沿基准链还原
   操作当时的完整冻结状态（与 `freeze_state` 直接冻结逐字节等价），
   对外字段与全量存储完全一致；新摘要仍按还原后的完整状态以同一固定编码
-  计算，既有摘要与链的前驱关系不可重写；
+  计算，既有摘要与链的前驱关系不可重写；审计区间核验对**无法还原**的
+  增量行（如 `delta.format` 被事后改为未知版本）不再整体报错，而是把
+  首条无法还原的快照按 `content_corrupted` 定位（HTTP 仍为 200），
+  合法的全量/增量混合区间（含首条增量基准在区间外）核验结论不变；
 - **事务与并发不变**：业务变更、快照行、链记录仍在同一事务提交，失败整体
   回滚（回滚编号空洞不影响后续接链与增量基准）；并发写入仍由版本行锁 +
   接链咨询锁串行化，快照不错序、链不分叉；
@@ -1790,8 +1844,8 @@ python3 examples/consistent_read_demo.py http://localhost:8000
 ## 七、测试
 
 核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）、快照摘要链
-（`tests/test_audit.py`，18 个用例：固定编码/时区无关/逐条重算/损坏与断链定位/
-仅边界不符/编号空洞/摘要格式）与快照增量存储（`tests/test_snapshot_delta.py`：
+（`tests/test_audit.py`，25 个用例：固定编码/时区无关/逐条重算/损坏与断链定位/
+仅边界不符/编号空洞/摘要格式/增量无法还原定位与先后 precedence）与快照增量存储（`tests/test_snapshot_delta.py`：
 操作序列往返还原逐字节等价/增量只含净变化/大小不随管网规模增长/摘要与存储
 形态无关/增删与空增量/未知格式拒绝）均不依赖数据库与第三方库，可直接用标准库运行：
 
@@ -1799,7 +1853,7 @@ python3 examples/consistent_read_demo.py http://localhost:8000
 python3 -m unittest tests.test_planning tests.test_audit tests.test_snapshot_delta -v
 ```
 
-路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**摘要链同事务接链/区间核验 ok·边界不符·内容损坏·链断定位/编号空洞不断链/倒序与缺端点 4xx/只读**、**只读一致性快照（关阀建议/隔离·复供·水源切换预演/流量核算/旁通/读数核对/调度演练在并发提交下只返回写入前或写入后的完整视图）**、**复供并发（两个同版安全确认恰好 1×200+1×409 且版本/阀位/快照各只有一份、与整网重导交错只串行不死锁、锁内按最终状态复核 409/422）**）；`tests/test_db_readonly.py` 用 mock 连接校验只读快照事务的连接级语义（`REPEATABLE READ READ ONLY`、回滚释放、异常安全）。需先安装依赖：
+路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**摘要链同事务接链/区间核验 ok·边界不符·内容损坏·链断定位/增量无法还原按内容损坏定位且 HTTP 仍为 200/编号空洞不断链/倒序与缺端点 4xx/只读**、**只读一致性快照（关阀建议/隔离·复供·水源切换预演/流量核算/旁通/读数核对/调度演练在并发提交下只返回写入前或写入后的完整视图）**、**复供并发（两个同版安全确认恰好 1×200+1×409 且版本/阀位/快照各只有一份、与整网重导交错只串行不死锁、锁内按最终状态复核 409/422）**）；`tests/test_db_readonly.py` 用 mock 连接校验只读快照事务的连接级语义（`REPEATABLE READ READ ONLY`、回滚释放、异常安全）。需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1816,7 +1870,8 @@ python3 -m unittest discover -s tests -v
 > `tests/test_snapshot_delta_pg.SnapshotDeltaPostgresTests` 验证增量快照存储：
 > 小范围操作只写增量行且读取/对照/核验透明还原完整状态、摘要按完整状态计算、
 > 整网重导回写全量且旧增量可查、同事务回滚不留半完成记录、增量深度上限与
-> 增量不更省时回退全量、重复初始化不改写既有摘要。
+> 增量不更省时回退全量、重复初始化不改写既有摘要、`delta.format` 被改为未知
+> 版本时区间核验把首条无法还原的快照定位为 `content_corrupted`（不再 500）。
 
 ## 八、项目结构
 

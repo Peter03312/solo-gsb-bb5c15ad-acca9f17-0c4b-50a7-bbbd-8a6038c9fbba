@@ -820,7 +820,8 @@ class AuditVerifyOut(BaseModel):
     verdict：
     - ok：区间内部链自洽，且起点前/终点摘要均与事先保存值相符；
     - boundary_mismatch：内部链自洽，仅起点前或终点边界摘要不符；
-    - content_corrupted：首个可定位的内容损坏（冻结字段被事后改写）；
+    - content_corrupted：首个可定位的内容损坏（冻结字段被事后改写，
+      或增量载荷无法还原——如 delta.format 被改为未知版本）；
     - chain_broken：首个可定位的链路断裂（前一条摘要指针不符或无链记录）。
     """
 

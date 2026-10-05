@@ -256,6 +256,119 @@ class VerifyIntervalTests(unittest.TestCase):
         self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
         self.assertEqual(r["failure"]["snapshot_id"], 2)
 
+    # ---- 增量快照无法还原（如 delta.format 被事后改为未知版本）----
+
+    @staticmethod
+    def _make_unrestorable(row, reason="未知的快照增量格式：water-snapshot-delta/v999"):
+        # 模拟 db.list_snapshot_chain_rows 对还原失败行的标记：
+        # state 置 None 并记录 restore_error（链摘要列保持原样）
+        row["state"] = None
+        row["restore_error"] = reason
+
+    def test_unrestorable_delta_located_as_content_corrupted(self):
+        rows = build_rows(4)
+        self._make_unrestorable(rows[2])  # 快照 3 的增量载荷无法还原
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["failure"]["kind"], "content_corrupted")
+        self.assertEqual(r["failure"]["snapshot_id"], 3)
+        self.assertEqual(r["failure"]["previous_snapshot_id"], 2)
+        # 无法重算摘要：expected_digest 为 None，actual 为链上记录值
+        self.assertIsNone(r["failure"]["expected_digest"])
+        self.assertEqual(
+            r["failure"]["actual_digest"], rows[2]["stored_digest"]
+        )
+        self.assertIn("无法", r["failure"]["message"])
+        # digests 仅含损坏点之前已核验通过的条目
+        self.assertEqual([d["snapshot_id"] for d in r["digests"]], [1, 2])
+
+    def test_unrestorable_first_snapshot_reports_empty_digests(self):
+        rows = build_rows(3)
+        self._make_unrestorable(rows[0])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], 1)
+        self.assertIsNone(r["failure"]["previous_snapshot_id"])
+        self.assertEqual(r["digests"], [])
+
+    def test_unrestorable_beats_end_boundary_mismatch(self):
+        # 无法还原 + 终点摘要也不符：必须报告内部损坏，而非仅边界不符
+        rows = build_rows(3)
+        self._make_unrestorable(rows[1])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest="0" * 64,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], 2)
+
+    def test_earlier_chain_break_takes_precedence_over_unrestorable(self):
+        # 第二条断链、第三条无法还原：报告更早的断链
+        rows = build_rows(4)
+        rows[1]["stored_prev_digest"] = "9" * 64
+        self._make_unrestorable(rows[2])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CHAIN_BROKEN)
+        self.assertEqual(r["failure"]["snapshot_id"], 2)
+        self.assertEqual([d["snapshot_id"] for d in r["digests"]], [1])
+
+    def test_earlier_content_corruption_takes_precedence_over_unrestorable(self):
+        # 第二条内容被改写、第三条无法还原：报告更早的内容损坏
+        rows = build_rows(4)
+        rows[1]["state"]["nodes"][0]["name"] = "TAMPERED"
+        self._make_unrestorable(rows[2])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(r["failure"]["snapshot_id"], 2)
+        # 重算摘要可定位的损坏仍给出应有/实际摘要
+        self.assertIsNotNone(r["failure"]["expected_digest"])
+        self.assertEqual([d["snapshot_id"] for d in r["digests"]], [1])
+
+    def test_unrestorable_row_with_broken_pointer_reports_chain_broken(self):
+        # 同一条上链指针不符且无法还原：链路断裂先于内容判定
+        rows = build_rows(3)
+        rows[1]["stored_prev_digest"] = "b" * 64
+        self._make_unrestorable(rows[1])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CHAIN_BROKEN)
+        self.assertEqual(r["failure"]["snapshot_id"], 2)
+
+    def test_unrestorable_row_without_chain_record_reports_chain_broken(self):
+        # 同一条上无链记录且无法还原：仍按链路断裂定位
+        rows = build_rows(3)
+        rows[1]["stored_digest"] = None
+        rows[1]["stored_prev_digest"] = None
+        self._make_unrestorable(rows[1])
+        r = audit.verify_interval(
+            rows,
+            pre_start_digest=audit.GENESIS_DIGEST,
+            end_digest="0" * 64,
+        )
+        self.assertEqual(r["verdict"], audit.VERDICT_CHAIN_BROKEN)
+        self.assertEqual(r["failure"]["snapshot_id"], 2)
+
     def test_digest_case_normalized(self):
         rows = build_rows(2)
         r = audit.verify_interval(

@@ -23,7 +23,9 @@
 
 注意：内容损坏 / 链路断裂（content_corrupted / chain_broken）需要有人绕过
 服务直接改写数据库才能复现，正常 API 没有任何改写快照的路径；核验逻辑见
-app/audit.py 的 verify_interval。
+app/audit.py 的 verify_interval。增量快照的 delta.format 被改为未知版本
+（无法还原完整冻结状态）同样按 content_corrupted 定位到首条无法还原的
+快照并以 HTTP 200 返回（failure.expected_digest 为 null），不再返回 500。
 """
 import json
 import os

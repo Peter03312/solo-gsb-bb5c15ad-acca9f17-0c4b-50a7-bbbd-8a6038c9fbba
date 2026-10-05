@@ -756,6 +756,28 @@ def _resolve_rows(conn, rows: list[dict]) -> list[dict]:
     return rows
 
 
+def _resolve_rows_lenient(conn, rows: list[dict]) -> list[dict]:
+    """_resolve_rows 的容错变体（仅供审计区间核验使用）。
+
+    还原失败（增量格式未知、基准快照缺失、回溯深度异常等外部破坏）不再
+    抛错中断整个核验请求：该行 state 保持 None 并就地记录 restore_error，
+    由核验逻辑把**首条无法还原的快照**定位为内容损坏；依赖它的后续增量行
+    同样无法还原，会各自带上 restore_error（核验在首个问题处停止，不会
+    读到它们）。可还原的行（含基准在区间之外的增量行）行为与
+    _resolve_rows 完全一致。
+    """
+    by_id = {row["id"]: row for row in rows}
+    cache: dict[int, dict] = {}
+    for row in rows:
+        if row["state"] is None:
+            try:
+                row["state"] = _resolve_row_state(conn, row, cache, by_id)
+            except Exception as exc:  # 任何还原失败都按内容损坏定位，绝不 500
+                row["state"] = None
+                row["restore_error"] = str(exc)
+    return rows
+
+
 def insert_state_snapshot(
     conn,
     *,
@@ -1103,7 +1125,9 @@ def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
     按编号升序；回滚造成的编号空洞自然不产生行（核验时不算断链）。
     LEFT JOIN 使缺少链记录的快照（被外部破坏）也能返回，由核验逻辑定位
     为链路断裂，而不是静默忽略。返回项含 stored_digest / stored_prev_digest。
-    增量行的 state 已沿基准链（可能延伸到区间起点之前）还原为完整冻结状态。
+    增量行的 state 沿基准链（可能延伸到区间起点之前）还原为完整冻结状态；
+    还原失败（如 delta.format 被事后改为未知版本）不抛错，该行 state 为
+    None 并带 restore_error，由核验逻辑定位为内容损坏（HTTP 仍为 200）。
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -1117,5 +1141,5 @@ def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
             (start_id, end_id),
         )
         rows = cur.fetchall()
-    _resolve_rows(conn, rows)
+    _resolve_rows_lenient(conn, rows)
     return [dict(r) for r in rows]

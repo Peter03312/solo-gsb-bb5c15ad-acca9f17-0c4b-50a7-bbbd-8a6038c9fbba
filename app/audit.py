@@ -142,6 +142,9 @@ def verify_interval(
     rows 每项除快照片段外须含：
       - stored_digest：建链时写入的摘要；无链行（未入链）时为 None
       - stored_prev_digest：建链时写入的前一条摘要；无链行时为 None
+      - restore_error（可选）：增量行无法沿基准链还原完整冻结状态时的
+        原因（如 delta.format 被事后改为未知版本）；带此键的行 state 为
+        None，按内容损坏定位到该条，而不是让核验请求整体失败
 
     本函数不做端点存在性/倒序检查（由路由层负责）。返回结构：
 
@@ -168,10 +171,13 @@ def verify_interval(
       1. 无链行（stored_digest 为 None）→ 链路断裂（该条）；
       2. 从第二条起，stored_prev_digest 必须等于上一条现存快照的
          stored_digest；不符 → 链路断裂（该条）；
-      3. 用**存储的**前一条摘要重算内容摘要，与 stored_digest 不符 → 内容损坏。
+      3. 带 restore_error 的行（增量载荷无法还原完整冻结状态，如
+         delta.format 被事后改为未知版本）→ 内容损坏（该条），
+         此时无法重算摘要，expected_digest 为 None；
+      4. 用**存储的**前一条摘要重算内容摘要，与 stored_digest 不符 → 内容损坏。
          区间首条与入参 pre_start_digest 的比对属于**边界**，不在这里判定，
          因此审计员给错起点前摘要不会被误报为内容损坏；
-      4. 内部链全部自洽后，再比较起点前 / 终点两条边界摘要；仅边界不符时
+      5. 内部链全部自洽后，再比较起点前 / 终点两条边界摘要；仅边界不符时
          verdict=boundary_mismatch，failure 只描述边界。
     """
     pre = pre_start_digest.lower()
@@ -240,7 +246,26 @@ def verify_interval(
             }
             return result
 
-        # 3) 以存储的 prev_digest 重算：内容是否被事后改写只取决于
+        # 3) 增量行无法还原（如 delta.format 被事后改为未知版本）：
+        #    完整冻结状态无法重现、摘要无法重算，按内容损坏定位到该条；
+        #    排在此前的链路断裂/内容损坏已在上面先行报告
+        restore_error = row.get("restore_error")
+        if restore_error:
+            result["verdict"] = VERDICT_CONTENT_CORRUPTED
+            result["failure"] = {
+                "kind": VERDICT_CONTENT_CORRUPTED,
+                "snapshot_id": sid,
+                "previous_snapshot_id": prev_id,
+                "expected_digest": None,
+                "actual_digest": stored.lower(),
+                "message": (
+                    f"快照 {sid} 的冻结状态无法沿基准链还原（{restore_error}），"
+                    f"内容已被改写或损坏"
+                ),
+            }
+            return result
+
+        # 4) 以存储的 prev_digest 重算：内容是否被事后改写只取决于
         #    “按链上记录的链接重算能否复现链上记录的摘要”
         recompute_prev = stored_prev.lower() if stored_prev else expected_prev
         recomputed = compute_snapshot_digest(row, recompute_prev)
@@ -265,7 +290,7 @@ def verify_interval(
         prev_stored = stored.lower()
         prev_id = sid
 
-    # 4) 内部链自洽（逐条按存储链接重算一致）：核验起点前 / 终点边界
+    # 5) 内部链自洽（逐条按存储链接重算一致）：核验起点前 / 终点边界
     expected_pre = rows[0]["stored_prev_digest"]
     expected_pre = expected_pre.lower() if expected_pre is not None else None
     expected_end = rows[-1]["stored_digest"].lower()

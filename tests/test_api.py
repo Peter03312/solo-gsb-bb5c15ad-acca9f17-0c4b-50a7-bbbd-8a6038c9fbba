@@ -3509,6 +3509,71 @@ class SnapshotChainAuditTests(unittest.TestCase):
             [d["snapshot_id"] for d in body["digests"]], ids[:1]
         )
 
+    def test_verify_unrestorable_delta_reports_content_corrupted_not_500(self):
+        # 区间内某条增量快照的 delta.format 被事后改为未知版本：
+        # 数据访问层不再抛错（否则 500），而是在该行标记 restore_error；
+        # 接口须以 HTTP 200 把首条无法还原的快照报告为 content_corrupted
+        ids = self._make_chain(3)
+        end_digest = STORE.chains[ids[-1]]["digest"]
+        original = db.list_snapshot_chain_rows
+
+        def tampered(conn, start_id, end_id):
+            rows = original(conn, start_id, end_id)
+            for row in rows:
+                if row["id"] == ids[1]:
+                    row["state"] = None
+                    row["restore_error"] = (
+                        "未知的快照增量格式：water-snapshot-delta/v999"
+                    )
+            return rows
+
+        db.list_snapshot_chain_rows = tampered
+        try:
+            r = self._verify(ids[0], ids[-1], audit.GENESIS_DIGEST, end_digest)
+        finally:
+            db.list_snapshot_chain_rows = original
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["verdict"], "content_corrupted")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["failure"]["kind"], "content_corrupted")
+        self.assertEqual(body["failure"]["snapshot_id"], ids[1])
+        self.assertEqual(body["failure"]["previous_snapshot_id"], ids[0])
+        # 无法重算摘要：expected_digest 为 null，actual 为链上记录值
+        self.assertIsNone(body["failure"]["expected_digest"])
+        self.assertEqual(
+            body["failure"]["actual_digest"], STORE.chains[ids[1]]["digest"]
+        )
+        # digests 仅含损坏点之前已核验通过的条目
+        self.assertEqual(
+            [d["snapshot_id"] for d in body["digests"]], ids[:1]
+        )
+
+    def test_verify_earlier_problem_beats_later_unrestorable_delta(self):
+        # 第二条链指针被篡改（断链）、第三条增量无法还原：仍报告更早的断链
+        ids = self._make_chain(3)
+        STORE.chains[ids[1]]["prev_digest"] = "9" * 64
+        end_digest = STORE.chains[ids[-1]]["digest"]
+        original = db.list_snapshot_chain_rows
+
+        def tampered(conn, start_id, end_id):
+            rows = original(conn, start_id, end_id)
+            for row in rows:
+                if row["id"] == ids[2]:
+                    row["state"] = None
+                    row["restore_error"] = "未知的快照增量格式：v0"
+            return rows
+
+        db.list_snapshot_chain_rows = tampered
+        try:
+            r = self._verify(ids[0], ids[-1], audit.GENESIS_DIGEST, end_digest)
+        finally:
+            db.list_snapshot_chain_rows = original
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["verdict"], "chain_broken")
+        self.assertEqual(body["failure"]["snapshot_id"], ids[1])
+
     def test_verify_chain_break_is_located(self):
         ids = self._make_chain(3)
         # 篡改链上第二条的 prev 指针（内容未变），断链应在引用它的第三条定位

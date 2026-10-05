@@ -17,6 +17,7 @@ monkeypatch 的真实 app.db 副本。
     DATABASE_URL=postgresql://water:water@localhost:5432/water \
     RUN_DB_TESTS=1 python3 -m unittest tests.test_snapshot_delta_pg -v
 """
+import json
 import os
 import unittest
 
@@ -322,6 +323,88 @@ class SnapshotDeltaPostgresTests(unittest.TestCase):
         self.assertEqual(chain[1], import_chain[0])  # prev_digest 接 import
 
     # ---------------------------------------------------------- 回退全量的两种情形
+
+    def test_unknown_delta_format_located_as_content_corrupted(self):
+        # 区间内某条增量快照的 delta.format 被事后改为未知版本：
+        # 审计核验不再 500，而是把首条无法还原的快照定位为内容损坏
+        version, snap_import = self._import()
+        out = self._submit(version)
+        snap_submit = out["snapshot_id"]
+        out = self._switch(out["version"], False)
+        snap_last = out["snapshot_id"]
+
+        # 篡改前：合法的全量 + 增量混合区间（首条增量的基准在区间外）核验通过
+        with db.read_transaction() as conn:
+            rows = db.list_snapshot_chain_rows(conn, snap_submit, snap_last)
+        result = audit.verify_interval(
+            rows,
+            pre_start_digest=_prev_chain_digest(snap_submit),
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(result["verdict"], audit.VERDICT_OK, result.get("failure"))
+
+        # 绕过 API 直改库：把中间增量快照的格式版本改为未知值（验毕恢复）
+        _row, _chain = _raw_row(snap_submit)
+        original_delta = _row[2]
+        tampered = dict(original_delta, format="water-snapshot-delta/v999")
+        conn = psycopg2.connect(get_settings().database_url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE state_snapshots SET delta = %s WHERE id = %s",
+                    (json.dumps(tampered), snap_submit),
+                )
+            try:
+                with db.read_transaction() as read_conn:
+                    rows = db.list_snapshot_chain_rows(
+                        read_conn, snap_import, snap_last
+                    )
+            finally:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE state_snapshots SET delta = %s WHERE id = %s",
+                        (json.dumps(original_delta), snap_submit),
+                    )
+        finally:
+            conn.close()
+
+        # 不再抛错：被篡改行与其后续依赖行都带 restore_error，state 为 None
+        by_id = {r["id"]: r for r in rows}
+        self.assertIsNone(by_id[snap_submit]["state"])
+        self.assertIn("未知的快照增量格式", by_id[snap_submit]["restore_error"])
+        self.assertIsNone(by_id[snap_last]["state"])
+        self.assertIn("restore_error", by_id[snap_last])
+        self.assertIsNotNone(by_id[snap_import]["state"])  # 全量行不受影响
+
+        # 首条无法还原的增量快照报告为 content_corrupted；
+        # digests 仅含此前核验通过的快照
+        result = audit.verify_interval(
+            rows,
+            pre_start_digest=_prev_chain_digest(snap_import),
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(result["verdict"], audit.VERDICT_CONTENT_CORRUPTED)
+        self.assertEqual(result["failure"]["snapshot_id"], snap_submit)
+        self.assertIsNone(result["failure"]["expected_digest"])
+        self.assertEqual(
+            result["failure"]["actual_digest"],
+            by_id[snap_submit]["stored_digest"],
+        )
+        self.assertEqual(
+            [d["snapshot_id"] for d in result["digests"]], [snap_import]
+        )
+
+        # 篡改已恢复：同一区间重新核验应再次通过（核验全程只读）
+        with db.read_transaction() as conn:
+            rows = db.list_snapshot_chain_rows(conn, snap_import, snap_last)
+        result = audit.verify_interval(
+            rows,
+            pre_start_digest=_prev_chain_digest(snap_import),
+            end_digest=rows[-1]["stored_digest"],
+        )
+        self.assertEqual(result["verdict"], audit.VERDICT_OK, result.get("failure"))
+
 
     def test_delta_depth_cap_forces_periodic_full_snapshot(self):
         self._import()
